@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>病理切片拼接查看器</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #171c24; --fg: #e6e9ee; --muted: #8b94a3;
+    --accent: #4c9aff; --border: #262d38;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--fg);
+    font: 13px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  #viewport { position: absolute; inset: 0; cursor: grab; touch-action: none; }
+  #viewport.dragging { cursor: grabbing; }
+  #stage { position: absolute; left: 0; top: 0; transform-origin: 0 0;
+    will-change: transform; }
+  #stage img { position: absolute; display: block; user-select: none;
+    -webkit-user-drag: none; }
+  #hud {
+    position: absolute; top: 12px; left: 12px; z-index: 10;
+    background: rgba(23, 28, 36, 0.92); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 14px; backdrop-filter: blur(8px);
+    min-width: 210px;
+  }
+  #hud h1 { font-size: 13px; margin: 0 0 6px; font-weight: 600; }
+  #hud .row { color: var(--muted); display: flex; justify-content: space-between;
+    gap: 12px; margin: 2px 0; }
+  #hud .row b { color: var(--fg); font-weight: 500; }
+  #controls { position: absolute; right: 12px; bottom: 12px; z-index: 10;
+    display: flex; flex-direction: column; gap: 8px; }
+  #controls button {
+    width: 42px; height: 42px; border-radius: 8px; border: 1px solid var(--border);
+    background: rgba(23,28,36,.92); color: var(--fg); font-size: 20px;
+    cursor: pointer; backdrop-filter: blur(8px);
+  }
+  #controls button:hover { border-color: var(--accent); color: var(--accent); }
+  #zoombar { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+    z-index: 10; background: rgba(23,28,36,.92); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 12px; color: var(--muted); }
+  #loading { position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; color: var(--muted); font-size: 15px; z-index: 20; }
+  #tooltip { position: absolute; z-index: 10; background: rgba(23,28,36,.95);
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
+    font-size: 11px; color: var(--muted); pointer-events: none; display: none; }
+</style>
+</head>
+<body>
+<div id="viewport">
+  <div id="stage"></div>
+</div>
+<div id="loading">正在加载金字塔清单…</div>
+<div id="hud" hidden>
+  <h1>病理全切片拼接结果</h1>
+  <div class="row"><span>全图尺寸</span><b id="dim">-</b></div>
+  <div class="row"><span>金字塔层级</span><b id="lvls">-</b></div>
+  <div class="row"><span>当前层级</span><b id="curlvl">-</b></div>
+  <div class="row"><span>缩放</span><b id="zoom">-</b></div>
+  <div class="row"><span>中心坐标</span><b id="coord">-</b></div>
+</div>
+<div id="controls">
+  <button id="zoomin" title="放大">+</button>
+  <button id="zoomout" title="缩小">−</button>
+  <button id="fit" title="适合窗口">⛶</button>
+  <button id="reset" title="1:1">1∶1</button>
+</div>
+<div id="zoombar">滚轮缩放 · 拖拽平移 · 双击放大 · 右键/Shift+双击缩小</div>
+<div id="tooltip"></div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------------------
+// 自研轻量金字塔查看器:无外部依赖,直接消费 pyramid/manifest.json。
+// 层级选择、瓦片按需加载、LOD 切换、惯性平移、缩放下的瓦片淡入。
+// ---------------------------------------------------------------------------
+const TILE = (function () {
+  const viewport = document.getElementById("viewport");
+  const stage = document.getElementById("stage");
+  const loading = document.getElementById("loading");
+  const hud = document.getElementById("hud");
+  const tooltip = document.getElementById("tooltip");
+  const els = {
+    dim: document.getElementById("dim"),
+    lvls: document.getElementById("lvls"),
+    curlvl: document.getElementById("curlvl"),
+    zoom: document.getElementById("zoom"),
+    coord: document.getElementById("coord"),
+  };
+
+  let manifest = null;
+  let baseTile = 256;
+  // 视图状态:x/y 为全图左上角在视口中的位置,scale 为显示/全图像素比
+  const view = { x: 0, y: 0, scale: 1 };
+  let currentLevel = -1;
+  const tileCache = new Map();      // key -> img 元素
+  const loadingSet = new Set();
+  const anim = { vx: 0, vy: 0, raf: 0 };
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  async function boot(baseUrl) {
+    const res = await fetch(baseUrl + "manifest.json");
+    if (!res.ok) throw new Error("manifest 加载失败: " + res.status);
+    manifest = await res.json();
+    baseTile = manifest.tile_size;
+    els.dim.textContent = manifest.full_width + " × " + manifest.full_height;
+    els.lvls.textContent = manifest.levels.length + " 层";
+    loading.hidden = true;
+    hud.hidden = false;
+    fitToView();
+    requestRender();
+  }
+
+  function fitToView() {
+    const r = viewport.getBoundingClientRect();
+    const s = Math.min(r.width / manifest.full_width,
+                       r.height / manifest.full_height);
+    view.scale = s;
+    view.x = (r.width - manifest.full_width * s) / 2;
+    view.y = (r.height - manifest.full_height * s) / 2;
+    anim.vx = anim.vy = 0;
+  }
+
+  // 由当前 scale 选最合适的金字塔层(使屏幕瓦片接近 baseTile 像素)
+  function pickLevel() {
+    let best = 0, bestDiff = Infinity;
+    for (const lv of manifest.levels) {
+      // 该层 1 像素 = 全图 2^level 像素;屏幕上 1 瓦片像素显示为
+      // scale * 2^level,目标接近 1
+      const screenTile = view.scale * (2 ** lv.level) * baseTile;
+      const diff = Math.abs(Math.log(screenTile / baseTile));
+      if (diff < bestDiff) { bestDiff = diff; best = lv.level; }
+    }
+    return clamp(best, 0, manifest.levels.length - 1);
+  }
+
+  function tileUrl(level, r, c) {
+    return `tiles/level_${level}/${r}_${c}.jpg`;
+  }
+
+  function getTile(level, r, c) {
+    const key = level + "/" + r + "/" + c;
+    if (tileCache.has(key)) return tileCache.get(key);
+    if (loadingSet.has(key)) return null;
+    loadingSet.add(key);
+    const img = new Image();
+    img.dataset.key = key;
+    img.style.opacity = "0";
+    img.onload = () => {
+      loadingSet.delete(key);
+      img.style.transition = "opacity .18s ease";
+      img.style.opacity = "1";
+    };
+    img.onerror = () => { loadingSet.delete(key); tileCache.delete(key); };
+    img.src = tileUrl(level, r, c);
+    tileCache.set(key, img);
+    return img;
+  }
+
+  // 淘汰远离视口的瓦片,控制内存
+  function pruneCache(activeKeys) {
+    for (const key of tileCache.keys()) {
+      if (!activeKeys.has(key) && tileCache.size > 400) {
+        const img = tileCache.get(key);
+        if (img && img.parentNode) img.parentNode.removeChild(img);
+        tileCache.delete(key);
+      }
+    }
+  }
+
+  function render() {
+    anim.raf = 0;
+    const level = pickLevel();
+    if (level !== currentLevel) currentLevel = level;
+    const lv = manifest.levels[level];
+    const step = 2 ** level;                 // 该层每像素对应全图像素
+    const lvScale = view.scale * step;       // 该层像素 -> 屏幕像素
+    const r = viewport.getBoundingClientRect();
+
+    // 视口在该层坐标系下的范围
+    const x0 = clamp(Math.floor(-view.x / lvScale), 0, lv.cols - 1);
+    const x1 = clamp(Math.ceil((r.width - view.x) / lvScale), 0, lv.cols);
+    const y0 = clamp(Math.floor(-view.y / lvScale), 0, lv.rows - 1);
+    const y1 = clamp(Math.ceil((r.height - view.y) / lvScale), 0, lv.rows);
+
+    const active = new Set();
+    const keep = [];
+    for (let row = y0; row < y1; row++) {
+      for (let col = x0; col < x1; col++) {
+        const key = level + "/" + row + "/" + col;
+        active.add(key);
+        const img = getTile(level, row, col);
+        if (!img) continue;
+        const left = view.x + col * baseTile * lvScale;
+        const top = view.y + row * baseTile * lvScale;
+        const dispW = baseTile * lvScale;
+        img.style.transform =
+          `translate(${left.toFixed(2)}px,${top.toFixed(2)}px)`;
+        img.style.width = dispW.toFixed(2) + "px";
+        img.style.height = dispW.toFixed(2) + "px";
+        keep.push(img);
+      }
+    }
+    // 移除不属于当前层/视口的已挂载瓦片
+    for (const img of Array.from(stage.children)) {
+      if (!keep.includes(img)) stage.removeChild(img);
+    }
+    for (const img of keep) if (!img.parentNode) stage.appendChild(img);
+    pruneCache(active);
+
+    // HUD
+    els.curlvl.textContent = level + " / " + (manifest.levels.length - 1);
+    els.zoom.textContent = (view.scale * 100).toFixed(1) + "%";
+    const cx = ((r.width / 2 - view.x) / view.scale) | 0;
+    const cy = ((r.height / 2 - view.y) / view.scale) | 0;
+    els.coord.textContent = cx + ", " + cy;
+  }
+
+  function requestRender() {
+    if (!anim.raf) anim.raf = requestAnimationFrame(render);
+  }
+
+  function zoomAt(cx, cy, factor) {
+    const minS = Math.min(
+      viewport.clientWidth / manifest.full_width,
+      viewport.clientHeight / manifest.full_height) * 0.6;
+    const maxS = 64;                            // 最深放大 64 倍
+    const ns = clamp(view.scale * factor, minS, maxS);
+    const real = ns / view.scale;
+    // 以光标为不动点缩放
+    view.x = cx - (cx - view.x) * real;
+    view.y = cy - (cy - view.y) * real;
+    view.scale = ns;
+    anim.vx = anim.vy = 0;
+    requestRender();
+  }
+
+  // ---------------- 交互 ----------------
+  let dragging = false, lastX = 0, lastY = 0, moved = false;
+  viewport.addEventListener("pointerdown", (e) => {
+    if (e.button === 2) return;
+    dragging = true; moved = false;
+    viewport.classList.add("dragging");
+    viewport.setPointerCapture(e.pointerId);
+    lastX = e.clientX; lastY = e.clientY;
+    anim.vx = anim.vy = 0;
+  });
+  viewport.addEventListener("pointermove", (e) => {
+    // 坐标 tooltip
+    if (manifest) {
+      const wx = (e.clientX - view.x) / view.scale;
+      const wy = (e.clientY - view.y) / view.scale;
+      if (wx >= 0 && wy >= 0 && wx < manifest.full_width
+          && wy < manifest.full_height) {
+        tooltip.style.display = "block";
+        tooltip.style.left = (e.clientX + 14) + "px";
+        tooltip.style.top = (e.clientY + 14) + "px";
+        tooltip.textContent = "(" + (wx | 0) + ", " + (wy | 0) + ")";
+      } else tooltip.style.display = "none";
+    }
+    if (!dragging) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
+    view.x += dx; view.y += dy;
+    anim.vx = dx; anim.vy = dy;
+    requestRender();
+  });
+  const endDrag = () => {
+    if (!dragging) return;
+    dragging = false;
+    viewport.classList.remove("dragging");
+    glide();
+  };
+  viewport.addEventListener("pointerup", endDrag);
+  viewport.addEventListener("pointercancel", endDrag);
+  viewport.addEventListener("pointerleave",
+    () => { tooltip.style.display = "none"; });
+
+  // 惯性
+  function glide() {
+    if (Math.hypot(anim.vx, anim.vy) < 0.4) return;
+    view.x += anim.vx; view.y += anim.vy;
+    anim.vx *= 0.92; anim.vy *= 0.92;
+    requestRender();
+    requestAnimationFrame(glide);
+  }
+
+  viewport.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const r = viewport.getBoundingClientRect();
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    zoomAt(e.clientX - r.left, e.clientY - r.top, factor);
+  }, { passive: false });
+
+  viewport.addEventListener("dblclick", (e) => {
+    const r = viewport.getBoundingClientRect();
+    const factor = e.shiftKey || e.button === 2 ? 0.5 : 2.0;
+    zoomAt(e.clientX - r.left, e.clientY - r.top, factor);
+  });
+  viewport.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  document.getElementById("zoomin").onclick =
+    () => zoomAt(viewport.clientWidth / 2, viewport.clientHeight / 2, 1.5);
+  document.getElementById("zoomout").onclick =
+    () => zoomAt(viewport.clientWidth / 2, viewport.clientHeight / 2, 1 / 1.5);
+  document.getElementById("fit").onclick = () => { fitToView(); requestRender(); };
+  document.getElementById("reset").onclick =
+    () => { view.scale = 1; requestRender(); };
+
+  window.addEventListener("resize", requestRender);
+  window.addEventListener("keydown", (e) => {
+    const cx = viewport.clientWidth / 2, cy = viewport.clientHeight / 2;
+    if (e.key === "+" || e.key === "=") zoomAt(cx, cy, 1.4);
+    if (e.key === "-") zoomAt(cx, cy, 1 / 1.4);
+    if (e.key === "0") { fitToView(); requestRender(); }
+    const pan = 80;
+    if (e.key === "ArrowLeft") { view.x += pan; requestRender(); }
+    if (e.key === "ArrowRight") { view.x -= pan; requestRender(); }
+    if (e.key === "ArrowUp") { view.y += pan; requestRender(); }
+    if (e.key === "ArrowDown") { view.y -= pan; requestRender(); }
+  });
+
+  return { boot };
+})();
+
+// manifest 与 viewer 同目录;若通过 file:// 打开失败,改用 scripts/serve.py
+TILE.boot("").catch((err) => {
+  document.getElementById("loading").textContent =
+    "加载失败:" + err.message + "。请用 scripts/serve.py 启动本地服务。";
+});
+</script>
+</body>
+</html>

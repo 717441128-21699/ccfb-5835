@@ -16,3 +16,8 @@ node_modules/
 __pycache__/
 .venv/
 venv/
+
+# 拼接流水线产物(体积大,可由 scripts/run_demo.py 重新生成)
+out_*/
+_thumb_*.png
+*.pyc
